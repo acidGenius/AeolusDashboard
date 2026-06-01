@@ -1,0 +1,17 @@
+{
+  "name": "london-temp-trader",
+  "version": "0.1.0",
+  "description": "Weather-driven prediction helper for London temperature markets.",
+  "type": "commonjs",
+  "scripts": {
+    "predict": "node scripts/predict.js",
+    "record-observed": "node scripts/record_observed.js",
+    "analyze-accuracy": "node scripts/analyze_accuracy.js",
+    "fetch-observed": "node scripts/fetch_observed.js"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.8.1",
+    "dotenv": "^16.4.5",
+    "ethers": "^5.8.0"
+  }
+}

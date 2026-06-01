@@ -1,0 +1,669 @@
+const fs = require('fs/promises');
+const path = require('path');
+const fetch = global.fetch;
+const dotenv = require('dotenv');
+
+dotenv.config();
+
+const WEATHER_LATITUDE = 51.5074;
+const WEATHER_LONGITUDE = -0.1278;
+const WEATHER_TIMEZONE = 'UTC';
+const WEATHER_TARGET_CITY = 'London';
+
+const OPEN_METEO_MODELS = [
+  { id: 'ecmwf', label: 'ECMWF' },
+  { id: 'icon', label: 'ICON' },
+  { id: 'gfs', label: 'GFS' },
+  { id: 'nam', label: 'NAM' },
+  { id: 'gefs', label: 'GEFS' },
+  { id: 'ukmo', label: 'UKMO' },
+  { id: 'hrrr', label: 'HRRR' },
+  { id: 'ecmwf_ifs', label: 'ECMWF IFS' },
+  { id: 'icon_seamless', label: 'ICON Seamless' },
+  { id: 'gfs_seamless', label: 'GFS Seamless' },
+  { id: 'meteofrance_arpege_world', label: 'ARPEGE World' },
+  { id: 'knmi_seamless', label: 'KNMI Seamless' }
+];
+
+const EXTERNAL_SOURCES = [
+  { id: 'wttr', label: 'wttr.in' },
+  { id: 'metno', label: 'Met Norway (Frost)' }
+];
+
+const POLYMARKET_BASE_URL = process.env.POLYMARKET_BASE_URL || 'https://gamma-api.polymarket.com';
+const POLYMARKET_REST_BASE_URL = process.env.POLYMARKET_REST_BASE_URL || POLYMARKET_BASE_URL;
+const POLYMARKET_GRAPHQL_URL = process.env.POLYMARKET_GRAPHQL_URL || 'https://api.polymarket.com/v0/graphql';
+const POLYMARKET_MARKET_ID = process.env.POLYMARKET_MARKET_ID;
+const POLYMARKET_SEARCH_KEYWORD = process.env.POLYMARKET_SEARCH_KEYWORD ?? 'London temperature';
+const VALUE_DIFF_THRESHOLD = parseFloat(process.env.VALUE_TEMPERATURE_DIFF_THRESHOLD ?? '1.2');
+const OUTCOME_TEMPERATURE_MAP = (() => {
+  if (!process.env.OUTCOME_TEMPERATURE_MAP) return {};
+  try {
+    return JSON.parse(process.env.OUTCOME_TEMPERATURE_MAP);
+  } catch (error) {
+    console.warn('OUTCOME_TEMPERATURE_MAP is not valid JSON, ignoring it.');
+    return {};
+  }
+})();
+const CONSENSUS_THRESHOLD = parseFloat(process.env.CONSENSUS_THRESHOLD ?? '0.75');
+const CONSENSUS_TOLERANCE = parseFloat(process.env.CONSENSUS_TOLERANCE ?? '0.4');
+
+const TARGET_DAY_OFFSET = (() => {
+  const value = parseInt(process.env.TARGET_DAY_OFFSET ?? '1', 10);
+  return Number.isNaN(value) ? 1 : value;
+})();
+const LOG_DIR = path.resolve(process.cwd(), 'logs');
+const DEFAULT_LOG_PATH = path.join(LOG_DIR, 'predictions.ndjson');
+const LOG_PATH = path.resolve(process.cwd(), process.env.PREDICTION_LOG_PATH || DEFAULT_LOG_PATH);
+const OBSERVED_LOG_PATH = path.resolve(LOG_DIR, process.env.OBSERVED_LOG_PATH || 'observed-london.ndjson');
+const ADDITIONAL_PREDICTION_LOG_PATHS = [
+  LOG_PATH,
+  path.resolve(LOG_DIR, 'predictions-same-day.ndjson')
+];
+const HISTORY_MAX_ENTRIES = parseInt(process.env.HISTORY_MAX_ENTRIES ?? '60', 10);
+const HISTORY_WEIGHT_ALPHA = parseFloat(process.env.HISTORY_WEIGHT_ALPHA ?? '0.3');
+const MIN_META_ERROR = parseFloat(process.env.MIN_META_ERROR ?? '0.35');
+const META_ERROR_EPSILON = parseFloat(process.env.META_ERROR_EPSILON ?? '0.1');
+
+async function ensureLogDir() {
+  try {
+    await fs.mkdir(path.dirname(LOG_PATH), { recursive: true });
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+}
+
+function formatDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function targetDates(start = new Date(), targetOffset = 1) {
+  const base = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const today = new Date(base);
+  const target = new Date(base);
+  target.setUTCDate(target.getUTCDate() + targetOffset);
+  const after = new Date(target);
+  after.setUTCDate(after.getUTCDate() + 1);
+  return {
+    today: formatDate(today),
+    target: formatDate(target),
+    after: formatDate(after)
+  };
+}
+
+async function fetchOpenMeteoModel(modelId, startDate, endDate) {
+  const params = new URLSearchParams({
+    latitude: WEATHER_LATITUDE.toString(),
+    longitude: WEATHER_LONGITUDE.toString(),
+    daily: 'temperature_2m_max',
+    start_date: startDate,
+    end_date: endDate,
+    timezone: WEATHER_TIMEZONE,
+    model: modelId
+  });
+  const url = `https://api.open-meteo.com/v1/forecast?${params}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Open-Meteo (${modelId}) failed: ${response.status} ${response.statusText}`);
+  }
+  const data = await response.json();
+  if (!data.daily || !data.daily.time || !data.daily.temperature_2m_max) {
+    throw new Error(`Open-Meteo (${modelId}) returned unexpected payload`);
+  }
+  return { source: `open-meteo:${modelId}`, label: modelId.toUpperCase(), payload: data.daily };
+}
+
+async function fetchWttrMax(targetDate) {
+  const url = `https://wttr.in/${encodeURIComponent(WEATHER_TARGET_CITY)}?format=j1`;
+  const response = await fetch(url, { headers: { 'User-Agent': 'Jarvis-weather/1.0' } });
+  if (!response.ok) {
+    throw new Error(`wttr.in failed with ${response.status}`);
+  }
+  const data = await response.json();
+  const day = (data?.weather ?? []).find((item) => item?.date === targetDate);
+  if (!day) throw new Error('wttr.in response missing target day');
+  const max = Number.parseFloat(day?.maxtempC);
+  if (Number.isNaN(max)) throw new Error('wttr.in returned invalid max temp');
+  return { source: 'wttr', label: 'wttr.in', maxTemp: max };
+}
+
+async function fetchMetNoMax(targetDate) {
+  const url = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${WEATHER_LATITUDE}&lon=${WEATHER_LONGITUDE}`;
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Jarvis-weather/1.0 (jarvis@openclaw.ai)',
+      Accept: 'application/json'
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`Met Norway failed with ${response.status}`);
+  }
+  const data = await response.json();
+  const timeseries = data?.properties?.timeseries ?? [];
+  const dailyTemps = {};
+  for (const entry of timeseries) {
+    const date = entry?.time?.slice(0, 10);
+    const temp = entry?.data?.instant?.details?.air_temperature;
+    if (!date || typeof temp !== 'number') continue;
+    if (!dailyTemps[date]) dailyTemps[date] = temp;
+    dailyTemps[date] = Math.max(dailyTemps[date], temp);
+  }
+  const max = dailyTemps[targetDate];
+  if (max === undefined) throw new Error('Met Norway missing target date');
+  return { source: 'metno', label: 'Met Norway', maxTemp: max };
+}
+
+async function fetch7TimerMax(targetDate) {
+  const url = `https://www.7timer.info/bin/api.pl?lon=${WEATHER_LONGITUDE}&lat=${WEATHER_LATITUDE}&product=civillight&output=json`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`7timer failed with ${response.status}`);
+  }
+  const data = await response.json();
+  const series = data?.dataseries ?? [];
+  const temps = series
+    .filter((entry) => entry?.date)
+    .reduce((acc, entry) => {
+      const rawDate = entry.date?.toString();
+      if (!rawDate) return acc;
+      const date = `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6, 8)}`;
+      const temp = entry?.temp2m?.max;
+      if (typeof temp !== 'number') return acc;
+      if (!acc[date]) acc[date] = temp;
+      acc[date] = Math.max(acc[date], temp);
+      return acc;
+    }, {});
+  const max = temps[targetDate];
+  if (max === undefined) throw new Error('7timer missing target date');
+  return { source: '7timer', label: '7timer', maxTemp: max };
+}
+
+function computeTargetDay(sources, targetDate) {
+  return sources.map((entry) => ({
+    source: entry.source,
+    label: entry.label,
+    maxTemp: entry.maxTemp
+  }));
+}
+
+function computeConsensus(models) {
+  if (!models.length) return null;
+  const tolerance = CONSENSUS_TOLERANCE;
+  const totalWeight = models.reduce((acc, model) => acc + (model.weight ?? 1), 0);
+  const candidates = models.map((model) => ({
+    value: Number(model.maxTemp.toFixed(2)),
+    source: model.source,
+    label: model.label,
+    weight: model.weight ?? 1
+  }));
+  const scored = candidates.map((candidate) => {
+    const agreeing = candidates.filter((other) => Math.abs(other.value - candidate.value) <= tolerance);
+    const agreementWeight = agreeing.reduce((acc, entry) => acc + entry.weight, 0);
+    return {
+      value: candidate.value,
+      agreementWeight,
+      sources: [...new Set(agreeing.map((entry) => entry.source))],
+      labels: [...new Set(agreeing.map((entry) => entry.label))]
+    };
+  });
+  scored.sort((a, b) => b.agreementWeight - a.agreementWeight || a.value - b.value);
+  const best = scored[0];
+  const ratio = totalWeight ? best.agreementWeight / totalWeight : 0;
+  return {
+    consensusValue: Number(best.value.toFixed(2)),
+    agreementRatio: Number(ratio.toFixed(2)),
+    sourceCount: best.sources.length,
+    agreeingSources: best.sources,
+    achieved: ratio >= CONSENSUS_THRESHOLD
+  };
+}
+
+function describeStats(models) {
+  if (!models.length) return null;
+  const values = models.map((model) => model.maxTemp);
+  const weights = models.map((model) => model.weight ?? 1);
+  const totalWeight = weights.reduce((acc, weight) => acc + weight, 0);
+  const plainMean = values.reduce((acc, value) => acc + value, 0) / values.length;
+  const sorted = [...values].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+  const weightedMean = totalWeight
+    ? models.reduce((acc, model) => acc + model.maxTemp * (model.weight ?? 1), 0) / totalWeight
+    : plainMean;
+  const variance = totalWeight
+    ? models.reduce((acc, model) => acc + (model.weight ?? 1) * Math.pow(model.maxTemp - weightedMean, 2), 0) / totalWeight
+    : values.reduce((acc, value) => acc + Math.pow(value - plainMean, 2), 0) / values.length;
+  const stddev = Math.sqrt(variance);
+  const spread = max - min;
+  const confidenceLabel = deriveConfidenceLabel(spread);
+  const confidenceScore = Number(Math.max(0, 1 - Math.min(1, spread / 5)).toFixed(2));
+  return { mean: weightedMean, median, min, max, stddev, spread, confidenceLabel, confidenceScore };
+}
+
+function deriveConfidenceLabel(spread) {
+  if (spread <= 0.6) return 'high';
+  if (spread <= 1.2) return 'medium';
+  return 'low';
+}
+
+async function readJsonLines(filePath) {
+  try {
+    const content = await fs.readFile(filePath, { encoding: 'utf8' });
+    return content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    console.warn('Failed to read ' + filePath + ': ' + error.message);
+    return [];
+  }
+}
+
+async function loadPredictionHistoryRecords() {
+  const uniquePaths = [...new Set(ADDITIONAL_PREDICTION_LOG_PATHS)];
+  const records = [];
+  for (const filePath of uniquePaths) {
+    const lines = await readJsonLines(filePath);
+    records.push(...lines);
+  }
+  return records;
+}
+
+async function loadObservedHistory() {
+  return readJsonLines(OBSERVED_LOG_PATH);
+}
+
+function buildObservedMap(observedEntries) {
+  return observedEntries.reduce((map, entry) => {
+    if (!entry?.date || typeof entry.maxTemp !== 'number') return map;
+    map[entry.date] = entry.maxTemp;
+    return map;
+  }, {});
+}
+
+function computeSourceErrorRecords(predictions, observedMap) {
+  const sorted = [...predictions].sort((a, b) => {
+    const aTime = Date.parse(a.timestamp || a.targetDate || a.date || '');
+    const bTime = Date.parse(b.timestamp || b.targetDate || b.date || '');
+    return (aTime || 0) - (bTime || 0);
+  });
+  const recordsBySource = {};
+  for (const record of sorted) {
+    const actual = observedMap[record.targetDate];
+    if (actual === undefined) continue;
+    const models = record?.ensembleForecast?.models ?? record?.models ?? [];
+    for (const model of models) {
+      if (typeof model.maxTemp !== 'number') continue;
+      const label = model.label ?? model.source ?? 'unknown';
+      const diff = model.maxTemp - actual;
+      recordsBySource[label] = recordsBySource[label] ?? [];
+      recordsBySource[label].push({
+        diff,
+        abs: Math.abs(diff),
+        timestamp: Date.parse(record.timestamp || record.targetDate || ''),
+        date: record.targetDate
+      });
+    }
+  }
+  return recordsBySource;
+}
+
+function computeEma(records, alpha) {
+  let ema = null;
+  for (const entry of records) {
+    if (ema === null) {
+      ema = entry.abs;
+      continue;
+    }
+    ema = alpha * entry.abs + (1 - alpha) * ema;
+  }
+  return ema;
+}
+
+function computeErrorStats(recordsBySource) {
+  const stats = {};
+  for (const [label, records] of Object.entries(recordsBySource)) {
+    const sorted = [...records].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    const windowed = sorted.slice(-HISTORY_MAX_ENTRIES);
+    if (!windowed.length) continue;
+    const rmse = Math.sqrt(windowed.reduce((acc, entry) => acc + entry.diff * entry.diff, 0) / windowed.length);
+    const ema = computeEma(windowed, HISTORY_WEIGHT_ALPHA);
+    stats[label] = {
+      rmse,
+      ema,
+      lastError: windowed[windowed.length - 1].diff,
+      samples: windowed.length
+    };
+  }
+  return stats;
+}
+
+function applyHistoricalWeights(models, errorStats) {
+  const enriched = models.map((model) => {
+    const key = model.label ?? model.source;
+    const stat = errorStats[key] ?? errorStats[model.source] ?? null;
+    const metaError = stat?.rmse && stat?.ema ? (stat.rmse + stat.ema) / 2 : stat?.rmse ?? stat?.ema ?? null;
+    const safeError = Math.max(metaError ?? MIN_META_ERROR, MIN_META_ERROR);
+    const weight = 1 / Math.pow(safeError + META_ERROR_EPSILON, 2);
+    return {
+      ...model,
+      metaError: metaError ? Number(metaError.toFixed(3)) : null,
+      weight,
+      history: stat
+    };
+  });
+  const totalWeight = enriched.reduce((acc, entry) => acc + entry.weight, 0);
+  return enriched.map((entry) => ({
+    ...entry,
+    normalizedWeight: totalWeight ? entry.weight / totalWeight : 0
+  }));
+}
+
+
+function ensureProbability(raw) {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === 'number') {
+    return raw > 1 ? raw / 100 : raw;
+  }
+  const parsed = Number(raw);
+  if (Number.isNaN(parsed)) return null;
+  return parsed > 1 ? parsed / 100 : parsed;
+}
+
+function parseTemperatureFromOutcome(outcomeName) {
+  if (!outcomeName) return null;
+  if (Object.prototype.hasOwnProperty.call(OUTCOME_TEMPERATURE_MAP, outcomeName)) {
+    return OUTCOME_TEMPERATURE_MAP[outcomeName];
+  }
+  const numbers = [...outcomeName.matchAll(/(-?\d+(?:\.\d+)?)/g)].map((match) => Number(match[1]));
+  if (!numbers.length) return null;
+  if (numbers.length === 1) {
+    const value = numbers[0];
+    if (/over|above|greater/i.test(outcomeName) && !/under|below|less/i.test(outcomeName)) {
+      return value + 0.25;
+    }
+    if (/under|below|less/i.test(outcomeName)) {
+      return value - 0.25;
+    }
+    return value;
+  }
+  const sum = numbers.reduce((acc, num) => acc + num, 0);
+  return sum / numbers.length;
+}
+
+function computeMarketExpectation(outcomes) {
+  if (!Array.isArray(outcomes) || outcomes.length === 0) return null;
+  const interpreted = [];
+  for (const outcome of outcomes) {
+    const rawProb = ensureProbability(outcome.probability);
+    if (rawProb === null) continue;
+    const tempValue = parseTemperatureFromOutcome(outcome.name);
+    if (tempValue === null || Number.isNaN(tempValue)) continue;
+    interpreted.push({ temperature: tempValue, probability: rawProb });
+  }
+  if (!interpreted.length) return null;
+  const totalProb = interpreted.reduce((acc, next) => acc + next.probability, 0);
+  if (totalProb === 0) return null;
+  const weighted = interpreted.reduce((acc, next) => acc + next.temperature * next.probability, 0);
+  return weighted / totalProb;
+}
+
+function isLikelyLondonTempMarket(market) {
+  if (!market || !market.name) return false;
+  const normalized = market.name.toLowerCase();
+  if (!normalized.includes('london')) return false;
+  return /temp|temperature|max|°c/.test(normalized);
+}
+
+function parseMarketTimestamp(market) {
+  return Date.parse(market.updatedAt || market.createdAt || market.timestamp || market.openedAt || market.created_at || market.updated_at || 0) || 0;
+}
+
+function normalizeMarketList(payload) {
+  if (!payload) return [];
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload.markets)) return payload.markets;
+  if (Array.isArray(payload.data?.markets)) return payload.data.markets;
+  if (Array.isArray(payload.data?.markets?.nodes)) return payload.data.markets.nodes;
+  return [];
+}
+
+async function fetchCandidateMarkets() {
+  const params = new URLSearchParams({
+    status: 'open',
+    search: POLYMARKET_SEARCH_KEYWORD,
+    limit: '20'
+  });
+  const url = `${POLYMARKET_BASE_URL}/markets?${params}`;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      console.warn(`Polymarket candidate list responded ${response.status}`);
+      return [];
+    }
+    const payload = await response.json();
+    return normalizeMarketList(payload);
+  } catch (error) {
+    console.warn(`Unable to fetch candidate markets: ${error.message}`);
+    return [];
+  }
+}
+
+async function findLatestLondonMarket() {
+  const markets = await fetchCandidateMarkets();
+  const candidates = markets.filter((market) => market.status === 'open' && isLikelyLondonTempMarket(market));
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => parseMarketTimestamp(b) - parseMarketTimestamp(a));
+  return candidates[0];
+}
+
+async function resolveMarketId() {
+  if (POLYMARKET_MARKET_ID) {
+    return POLYMARKET_MARKET_ID;
+  }
+  const latest = await findLatestLondonMarket();
+  if (!latest) {
+    console.warn('Unable to locate a London temperature market automatically.');
+    return null;
+  }
+  console.log(`Auto-selected Polymarket market ${latest.id} — ${latest.name}`);
+  return latest.id;
+}
+
+async function fetchPolymarketMarket(marketId) {
+  if (!marketId) {
+    console.warn('Polymarket market ID not available; skipping market fetch.');
+    return null;
+  }
+  const query = `
+    query Market($id: ID!) {
+      market(id: $id) {
+        id
+        name
+        status
+        question
+        outcomes {
+          id
+          name
+          probability
+        }
+      }
+    }
+  `;
+  const payload = { query, variables: { id: marketId } };
+  const response = await fetch(POLYMARKET_GRAPHQL_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    console.warn(`Polymarket API responded with ${response.status}. Skipping.`);
+    return null;
+  }
+  const data = await response.json();
+  if (!data.data || !data.data.market) {
+    console.warn('Polymarket response did not contain market data.');
+    return null;
+  }
+  return data.data.market;
+}
+
+async function logPrediction(record) {
+  await ensureLogDir();
+  const line = `${JSON.stringify(record)}\n`;
+  await fs.appendFile(LOG_PATH, line, { encoding: 'utf8' });
+}
+
+async function runPredictionCycle() {
+  const now = new Date();
+  const dates = targetDates(now, TARGET_DAY_OFFSET);
+  const targetDate = dates.target;
+
+  const predictionHistory = await loadPredictionHistoryRecords();
+  const observedHistory = await loadObservedHistory();
+  const observedMap = buildObservedMap(observedHistory);
+  const errorRecords = computeSourceErrorRecords(predictionHistory, observedMap);
+  const errorStats = computeErrorStats(errorRecords);
+
+  const openMeteoPromises = OPEN_METEO_MODELS.map(async (model) => {
+    try {
+      const forecast = await fetchOpenMeteoModel(model.id, dates.today, dates.after);
+      const index = forecast.payload.time.findIndex((day) => day === targetDate);
+      const value = forecast.payload.temperature_2m_max[index];
+      if (value === null || Number.isNaN(value)) {
+        console.warn(`Open-Meteo ${model.label} missing max for ${targetDate}`);
+        return null;
+      }
+      return { source: forecast.source, label: model.label, maxTemp: value };
+    } catch (error) {
+      console.warn(`Open-Meteo ${model.label} error: ${error.message}`);
+      return null;
+    }
+  });
+
+  const externalPromises = EXTERNAL_SOURCES.map(async (source) => {
+    try {
+      if (source.id === 'wttr') return await fetchWttrMax(targetDate);
+      if (source.id === 'metno') return await fetchMetNoMax(targetDate);
+      if (source.id === '7timer') return await fetch7TimerMax(targetDate);
+      return null;
+    } catch (error) {
+      console.warn(`${source.label} failed: ${error.message}`);
+      return null;
+    }
+  });
+
+  const readings = await Promise.all([...openMeteoPromises, ...externalPromises]);
+  const validForecasts = readings.filter(Boolean);
+  if (!validForecasts.length) {
+    throw new Error('All weather sources failed to provide a max temperature.');
+  }
+
+  const weightedModels = applyHistoricalWeights(validForecasts, errorStats);
+  const stats = describeStats(weightedModels);
+  const consensus = computeConsensus(weightedModels);
+  const observedDates = observedHistory.map((entry) => entry.date).filter(Boolean);
+  const latestObservedDate = observedDates.length ? observedDates.sort()[observedDates.length - 1] : null;
+
+  const ensembleForecast = {
+    models: weightedModels,
+    stats,
+    consensus,
+    history: {
+      observedDays: Object.keys(observedMap).length,
+      sourcesTracked: Object.keys(errorStats).length,
+      latestObservation: latestObservedDate
+    }
+  };
+
+  const marketId = await resolveMarketId();
+  const polymarketData = await fetchPolymarketMarket(marketId);
+  const marketExpectation = polymarketData ? computeMarketExpectation(polymarketData.outcomes) : null;
+
+  const marketLookup = {
+    id: marketId,
+    source: POLYMARKET_MARKET_ID ? 'static' : 'auto',
+    keyword: POLYMARKET_SEARCH_KEYWORD
+  };
+
+  const result = {
+    timestamp: now.toISOString(),
+    targetDate,
+    ensembleForecast: {
+      models: ensembleForecast.models,
+      stats: ensembleForecast.stats,
+      consensus: ensembleForecast.consensus
+    },
+    marketLookup,
+    market: polymarketData
+      ? {
+          id: polymarketData.id,
+          name: polymarketData.name,
+          status: polymarketData.status,
+          expectation: marketExpectation,
+          outcomeNames: polymarketData.outcomes.map((o) => o.name)
+        }
+      : null,
+    decision: null
+  };
+
+  if (marketExpectation !== null) {
+    const baseExpectation = ensembleForecast.consensus?.consensusValue ?? stats?.median;
+    const diff = baseExpectation - marketExpectation;
+    const valuePct = Math.abs(diff) / (marketExpectation || 1) * 100;
+    const direction = diff > 0 ? 'warmer' : 'cooler';
+    const wouldTrade = Math.abs(diff) >= VALUE_DIFF_THRESHOLD;
+    const confidenceScore = stats?.confidenceScore ?? null;
+    result.decision = {
+      diff: Number(diff.toFixed(2)),
+      valuePercent: Number(valuePct.toFixed(1)),
+      signal: wouldTrade ? 'YES' : 'NO',
+      direction,
+      marketExpectation: Number(marketExpectation.toFixed(2)),
+      ourExpectation: Number((baseExpectation ?? 0).toFixed(2)),
+      confidence: confidenceScore,
+      confidenceLabel: stats?.confidenceLabel ?? null
+    };
+  } else {
+    result.decision = {
+      signal: 'NONE',
+      reason: 'Unable to derive a market expectation from Polymarket outcomes.'
+    };
+  }
+
+  await logPrediction(result);
+
+  // Console-friendly summary
+  console.log('\n=========== Weather signal ===========');
+  console.log(`Target city: ${WEATHER_TARGET_CITY} (max temp for ${targetDate})`);
+  console.log(`Models/sources: ${ensembleForecast.models.map((m) => `${m.label}=${m.maxTemp.toFixed(1)}°C (w=${(m.normalizedWeight * 100).toFixed(1)}%)`).join(', ')}`);
+  if (ensembleForecast.stats) {
+    console.log(`Stats → min ${ensembleForecast.stats.min.toFixed(1)}°C, max ${ensembleForecast.stats.max.toFixed(1)}°C, mean ${ensembleForecast.stats.mean.toFixed(1)}°C, spread ${ensembleForecast.stats.spread.toFixed(1)}°C`);
+  }
+  if (ensembleForecast.consensus) {
+    console.log(`Consensus estimate: ${ensembleForecast.consensus.consensusValue.toFixed(2)}°C (${Math.round(ensembleForecast.consensus.agreementRatio * 100)}% of sources agree${ensembleForecast.consensus.achieved ? '' : '; below threshold'})`);
+  }
+  console.log(`Polymarket lookup: ${marketLookup.source} (${marketLookup.keyword}) → ${marketLookup.id ?? 'auto-search failed'}`);
+  if (result.market) {
+    console.log(`Polymarket (${result.market.name}) expectation: ${result.market.expectation?.toFixed(2) ?? 'n/a'}°C`);
+    console.log(`Decision signal: ${result.decision.signal}`);
+    if (result.decision.signal === 'YES') {
+      console.log(`We expect it to be ${result.decision.direction} by ${Math.abs(result.decision.diff).toFixed(2)}°C (value ${result.decision.valuePercent.toFixed(1)}%)`);
+    } else {
+      console.log('Value gap too small — hold position and watch how the forecast moves.');
+    }
+  } else {
+    console.log('Polymarket data unavailable — only weather consensus recorded.');
+  }
+  console.log(`Consensus sources agreeing: ${ensembleForecast.consensus?.agreeingSources?.join(', ') ?? 'n/a'}`);
+  console.log(`Log appended to ${LOG_PATH}`);
+  console.log('=======================================\n');
+}
+
+runPredictionCycle().catch((error) => {
+  console.error('Prediction cycle failed:', error.message);
+  process.exit(1);
+});

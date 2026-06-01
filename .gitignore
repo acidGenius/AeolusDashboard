@@ -1,0 +1,7 @@
+node_modules/
+logs/
+memory/
+.env
+.env.backup*
+.openclaw/
+npm-debug.log*
