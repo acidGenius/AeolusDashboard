@@ -19,7 +19,9 @@ const SCRIPTS = {
   fetchHistory: path.resolve(__dirname, 'fetch_history.js'),
   fetchObserved: path.resolve(__dirname, 'fetch_observed.js'),
   predict: path.resolve(__dirname, 'predict.js'),
-  analyze: path.resolve(__dirname, 'analyze_accuracy.js')
+  dailyReport: path.resolve(__dirname, 'daily_report.js'),
+  analyze: path.resolve(__dirname, 'analyze_accuracy.js'),
+  timingReport: path.resolve(__dirname, 'analyze_timing.js')
 };
 
 const args = process.argv.slice(2);
@@ -45,9 +47,13 @@ function run(scriptPath, label) {
   run(SCRIPTS.fetchHistory, 'Sync historical observations from Polymarket series');
   // Then fetch yesterday specifically (may not be resolved yet → falls back to ERA5).
   run(SCRIPTS.fetchObserved, 'Fetch yesterday\'s observed temperature');
+  // Send daily accuracy report to Telegram (compares past predictions vs Polymarket facts).
+  run(SCRIPTS.dailyReport, 'Send daily accuracy report');
+  // Run prediction for tomorrow.
   run(SCRIPTS.predict, 'Run prediction cycle');
   if (withAnalyze) {
     run(SCRIPTS.analyze, 'Analyze accuracy');
+    run(SCRIPTS.timingReport, 'Send timing analysis report');
   }
 
   console.log('\n🏁 Daily run complete.');

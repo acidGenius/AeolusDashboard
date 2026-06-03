@@ -100,6 +100,10 @@ const ADDITIONAL_PREDICTION_LOG_PATHS = [
   path.resolve(LOG_DIR, 'predictions-same-day.ndjson')
 ];
 const HISTORY_MAX_ENTRIES = parseInt(process.env.HISTORY_MAX_ENTRIES ?? '60', 10);
+
+// --silent flag: run without sending Telegram, log to hourly log instead of main log.
+const SILENT_MODE = process.argv.includes('--silent');
+const HOURLY_LOG_PATH = path.resolve(LOG_DIR, 'predictions-hourly.ndjson');
 const HISTORY_WEIGHT_ALPHA = parseFloat(process.env.HISTORY_WEIGHT_ALPHA ?? '0.3');
 const MIN_META_ERROR = parseFloat(process.env.MIN_META_ERROR ?? '0.35');
 const META_ERROR_EPSILON = parseFloat(process.env.META_ERROR_EPSILON ?? '0.1');
@@ -575,8 +579,10 @@ function normalizeGammaEvent(event) {
 
 async function logPrediction(record) {
   await ensureLogDir();
+  // Silent mode → hourly log; normal mode → main log.
+  const dest = SILENT_MODE ? HOURLY_LOG_PATH : LOG_PATH;
   const line = `${JSON.stringify(record)}\n`;
-  await fs.appendFile(LOG_PATH, line, { encoding: 'utf8' });
+  await fs.appendFile(dest, line, { encoding: 'utf8' });
 }
 
 async function runPredictionCycle() {
@@ -653,6 +659,7 @@ async function runPredictionCycle() {
   const result = {
     timestamp: now.toISOString(),
     targetDate,
+    targetDayOffset: TARGET_DAY_OFFSET,
     ensembleForecast: {
       models: ensembleForecast.models,
       stats: ensembleForecast.stats,
@@ -671,27 +678,36 @@ async function runPredictionCycle() {
     decision: null
   };
 
-  if (marketExpectation !== null) {
-    const baseExpectation = ensembleForecast.consensus?.consensusValue ?? stats?.median;
-    const diff = baseExpectation - marketExpectation;
-    const valuePct = Math.abs(diff) / (marketExpectation || 1) * 100;
-    const direction = diff > 0 ? 'warmer' : 'cooler';
-    const wouldTrade = Math.abs(diff) >= VALUE_DIFF_THRESHOLD;
+  if (polymarketData) {
+    // Round forecast to whole degree (Polymarket resolution precision).
+    const rawForecast = ensembleForecast.consensus?.consensusValue ?? stats?.median ?? 0;
+    const roundedForecast = Math.round(rawForecast);
     const confidenceScore = stats?.confidenceScore ?? null;
+
+    // Find the matching market outcome for our rounded forecast.
+    const targetOutcome = polymarketData.outcomes.find(o => {
+      const t = parseTemperatureFromOutcome(o.name);
+      return t !== null && Math.round(t) === roundedForecast;
+    }) ?? null;
+
     result.decision = {
-      diff: Number(diff.toFixed(2)),
-      valuePercent: Number(valuePct.toFixed(1)),
-      signal: wouldTrade ? 'YES' : 'NO',
-      direction,
-      marketExpectation: Number(marketExpectation.toFixed(2)),
-      ourExpectation: Number((baseExpectation ?? 0).toFixed(2)),
+      forecastRaw: Number(rawForecast.toFixed(2)),
+      forecastRounded: roundedForecast,
+      betOn: targetOutcome?.name ?? `${roundedForecast}°C`,
+      marketPrice: targetOutcome?.probability != null
+        ? Number(Number(targetOutcome.probability).toFixed(3))
+        : null,
       confidence: confidenceScore,
-      confidenceLabel: stats?.confidenceLabel ?? null
+      confidenceLabel: stats?.confidenceLabel ?? null,
+      spread: Number((stats?.spread ?? 0).toFixed(2))
     };
   } else {
     result.decision = {
-      signal: 'NONE',
-      reason: 'Unable to derive a market expectation from Polymarket outcomes.'
+      forecastRaw: Number((ensembleForecast.consensus?.consensusValue ?? stats?.median ?? 0).toFixed(2)),
+      forecastRounded: Math.round(ensembleForecast.consensus?.consensusValue ?? stats?.median ?? 0),
+      betOn: null,
+      marketPrice: null,
+      reason: 'Polymarket data unavailable'
     };
   }
 
@@ -705,38 +721,40 @@ async function runPredictionCycle() {
     console.log(`Stats → min ${ensembleForecast.stats.min.toFixed(1)}°C, max ${ensembleForecast.stats.max.toFixed(1)}°C, mean ${ensembleForecast.stats.mean.toFixed(1)}°C, spread ${ensembleForecast.stats.spread.toFixed(1)}°C`);
   }
   if (ensembleForecast.consensus) {
-    console.log(`Consensus estimate: ${ensembleForecast.consensus.consensusValue.toFixed(2)}°C (${Math.round(ensembleForecast.consensus.agreementRatio * 100)}% of sources agree${ensembleForecast.consensus.achieved ? '' : '; below threshold'})`);
+    console.log(`Consensus: ${ensembleForecast.consensus.consensusValue.toFixed(2)}°C → rounded: ${result.decision.forecastRounded}°C (${Math.round(ensembleForecast.consensus.agreementRatio * 100)}% sources agree, confidence: ${result.decision.confidenceLabel})`);
   }
-  console.log(`Polymarket lookup: ${marketLookup.source} slug="${marketLookup.slug ?? 'n/a'}" → ${marketLookup.id ?? 'not found'}`);
-  if (result.market) {
-    console.log(`Polymarket (${result.market.name}) expectation: ${result.market.expectation?.toFixed(2) ?? 'n/a'}°C`);
-    console.log(`Decision signal: ${result.decision.signal}`);
-    if (result.decision.signal === 'YES') {
-      console.log(`We expect it to be ${result.decision.direction} by ${Math.abs(result.decision.diff).toFixed(2)}°C (value ${result.decision.valuePercent.toFixed(1)}%)`);
-    } else {
-      console.log('Value gap too small — hold position and watch how the forecast moves.');
-    }
+  console.log(`Polymarket: ${marketLookup.slug ?? marketLookup.id ?? 'n/a'}`);
+  if (result.decision.betOn) {
+    const price = result.decision.marketPrice;
+    console.log(`🎯 BET ON: "${result.decision.betOn}" @ ${price != null ? (price * 100).toFixed(1) + '% market price' : 'price unknown'}`);
   } else {
     console.log('Polymarket data unavailable — only weather consensus recorded.');
   }
-  console.log(`Consensus sources agreeing: ${ensembleForecast.consensus?.agreeingSources?.join(', ') ?? 'n/a'}`);
-  console.log(`Log appended to ${LOG_PATH}`);
+  console.log(`Log appended to ${SILENT_MODE ? HOURLY_LOG_PATH : LOG_PATH}`);
   console.log('=======================================\n');
+
+  // Silent mode: skip Telegram, just log.
+  if (SILENT_MODE) return;
 
   // ── Telegram notification ─────────────────────────────────────────────────
   const d = result.decision;
-  const signalEmoji = d?.signal === 'YES' ? '🟢' : d?.signal === 'NO' ? '🔴' : '⚪';
-  const confLabel = ensembleForecast.stats?.confidenceLabel ?? 'n/a';
-  const modelCount = ensembleForecast.models.length;
-  const sourceList = ensembleForecast.consensus?.agreeingSources?.slice(0, 4).join(', ') ?? 'n/a';
+  const cons = ensembleForecast.consensus;
+  const st = ensembleForecast.stats;
+  const price = d.marketPrice != null ? `@ ${(d.marketPrice * 100).toFixed(1)}%` : '(price unknown)';
+  const agreePct = cons ? Math.round(cons.agreementRatio * 100) : 0;
 
-  let tgText = `${signalEmoji} <b>SIGNAL: ${d?.signal ?? 'NONE'}</b> — London max temp ${targetDate}\n`;
-  if (d?.signal === 'YES' || d?.signal === 'NO') {
-    tgText += `📊 Forecast: <b>${d.ourExpectation?.toFixed(2)}°C</b> | Market: <b>${d.marketExpectation?.toFixed(2)}°C</b> | Δ <b>${d.diff > 0 ? '+' : ''}${d.diff?.toFixed(2)}°C</b>\n`;
-    tgText += `📈 Direction: ${d.direction} | Value: ${d.valuePercent?.toFixed(1)}%\n`;
-  }
-  tgText += `🌡 Spread: ${ensembleForecast.stats?.spread?.toFixed(1)}°C | Confidence: ${confLabel} | Sources: ${modelCount} (${sourceList})\n`;
-  if (result.market?.name) tgText += `🏦 Market: ${result.market.name}`;
+  // Per-model breakdown — sorted by value
+  const modelLines = [...ensembleForecast.models]
+    .sort((a, b) => a.maxTemp - b.maxTemp)
+    .map(m => `  ${m.label}: ${m.maxTemp.toFixed(1)}°C`)
+    .join('\n');
+
+  let tgText = `🌡 <b>London max temp — ${targetDate}</b>\n\n`;
+  tgText += `<b>Models:</b>\n${modelLines}\n\n`;
+  tgText += `📊 <b>Stats:</b> min ${st?.min.toFixed(1)}°C | max ${st?.max.toFixed(1)}°C | spread ${st?.spread.toFixed(1)}°C\n`;
+  tgText += `🤝 <b>Consensus:</b> ${agreePct}% of models agree on <b>${cons?.consensusValue.toFixed(1)}°C</b>\n`;
+  tgText += `   → rounded to <b>${d.forecastRounded}°C</b> (confidence: ${d.confidenceLabel})\n\n`;
+  tgText += `🎯 <b>BET ON: "${d.betOn ?? 'unknown'}"</b> ${price}`;
 
   await sendTelegram(tgText);
 }

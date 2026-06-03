@@ -7,10 +7,14 @@
     "daily": "node scripts/run.js",
     "daily:analyze": "node scripts/run.js --analyze",
     "predict": "node scripts/predict.js",
+    "predict:silent": "node scripts/predict.js --silent",
     "fetch-observed": "node scripts/fetch_observed.js",
     "fetch-history": "node scripts/fetch_history.js",
     "record-observed": "node scripts/record_observed.js",
-    "analyze-accuracy": "node scripts/analyze_accuracy.js"
+    "analyze-accuracy": "node scripts/analyze_accuracy.js",
+    "daily-report": "node scripts/daily_report.js",
+    "timing-report": "node scripts/analyze_timing.js",
+    "scheduler": "node scripts/scheduler.js"
   },
   "dependencies": {
     "@polymarket/clob-client": "^5.8.1",
