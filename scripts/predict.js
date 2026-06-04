@@ -63,11 +63,9 @@ const OPEN_METEO_MODELS = [
   { id: 'knmi_seamless', label: 'KNMI Seamless' }
 ];
 
-const EXTERNAL_SOURCES = [
-  { id: 'wttr', label: 'wttr.in' },
-  { id: 'metno', label: 'Met Norway (Frost)' },
-  { id: '7timer', label: '7timer' }
-];
+// External sources: removed wttr.in, Met Norway, 7timer — consistently inaccurate for London.
+// UKMO (Met Office Unified Model) is already included via Open-Meteo above.
+const EXTERNAL_SOURCES = [];
 
 const POLYMARKET_BASE_URL = process.env.POLYMARKET_BASE_URL || 'https://gamma-api.polymarket.com';
 const POLYMARKET_REST_BASE_URL = process.env.POLYMARKET_REST_BASE_URL || POLYMARKET_BASE_URL;
@@ -158,70 +156,7 @@ async function fetchOpenMeteoModel(modelId, startDate, endDate) {
   }, { label: `Open-Meteo:${modelId}` });
 }
 
-async function fetchWttrMax(targetDate) {
-  return fetchWithRetry(async () => {
-    const url = `https://wttr.in/${encodeURIComponent(WEATHER_TARGET_CITY)}?format=j1`;
-    const response = await fetch(url, { headers: { 'User-Agent': 'Jarvis-weather/1.0' } });
-    if (!response.ok) throw new Error(`wttr.in failed with ${response.status}`);
-    const data = await response.json();
-    const day = (data?.weather ?? []).find((item) => item?.date === targetDate);
-    if (!day) throw new Error('wttr.in response missing target day');
-    const max = Number.parseFloat(day?.maxtempC);
-    if (Number.isNaN(max)) throw new Error('wttr.in returned invalid max temp');
-    return { source: 'wttr', label: 'wttr.in', maxTemp: max };
-  }, { label: 'wttr.in' });
-}
-
-async function fetchMetNoMax(targetDate) {
-  return fetchWithRetry(async () => {
-    const url = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${WEATHER_LATITUDE}&lon=${WEATHER_LONGITUDE}`;
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Jarvis-weather/1.0 (jarvis@openclaw.ai)',
-        Accept: 'application/json'
-      }
-    });
-    if (!response.ok) throw new Error(`Met Norway failed with ${response.status}`);
-    const data = await response.json();
-    const timeseries = data?.properties?.timeseries ?? [];
-    const dailyTemps = {};
-    for (const entry of timeseries) {
-      const date = entry?.time?.slice(0, 10);
-      const temp = entry?.data?.instant?.details?.air_temperature;
-      if (!date || typeof temp !== 'number') continue;
-      if (!dailyTemps[date]) dailyTemps[date] = temp;
-      dailyTemps[date] = Math.max(dailyTemps[date], temp);
-    }
-    const max = dailyTemps[targetDate];
-    if (max === undefined) throw new Error('Met Norway missing target date');
-    return { source: 'metno', label: 'Met Norway', maxTemp: max };
-  }, { label: 'Met Norway' });
-}
-
-async function fetch7TimerMax(targetDate) {
-  return fetchWithRetry(async () => {
-    const url = `https://www.7timer.info/bin/api.pl?lon=${WEATHER_LONGITUDE}&lat=${WEATHER_LATITUDE}&product=civillight&output=json`;
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`7timer failed with ${response.status}`);
-    const data = await response.json();
-    const series = data?.dataseries ?? [];
-    const temps = series
-      .filter((entry) => entry?.date)
-      .reduce((acc, entry) => {
-        const rawDate = entry.date?.toString();
-        if (!rawDate) return acc;
-        const date = `${rawDate.slice(0, 4)}-${rawDate.slice(4, 6)}-${rawDate.slice(6, 8)}`;
-        const temp = entry?.temp2m?.max;
-        if (typeof temp !== 'number') return acc;
-        if (!acc[date]) acc[date] = temp;
-        acc[date] = Math.max(acc[date], temp);
-        return acc;
-      }, {});
-    const max = temps[targetDate];
-    if (max === undefined) throw new Error('7timer missing target date');
-    return { source: '7timer', label: '7timer', maxTemp: max };
-  }, { label: '7timer' });
-}
+// Removed: fetchWttrMax, fetchMetNoMax, fetch7TimerMax — unreliable for London forecasts.
 
 function computeTargetDay(sources, targetDate) {
   return sources.map((entry) => ({
@@ -614,19 +549,7 @@ async function runPredictionCycle() {
     }
   });
 
-  const externalPromises = EXTERNAL_SOURCES.map(async (source) => {
-    try {
-      if (source.id === 'wttr') return await fetchWttrMax(targetDate);
-      if (source.id === 'metno') return await fetchMetNoMax(targetDate);
-      if (source.id === '7timer') return await fetch7TimerMax(targetDate);
-      return null;
-    } catch (error) {
-      console.warn(`${source.label} failed: ${error.message}`);
-      return null;
-    }
-  });
-
-  const readings = await Promise.all([...openMeteoPromises, ...externalPromises]);
+  const readings = await Promise.all([...openMeteoPromises]);
   const validForecasts = readings.filter(Boolean);
   if (!validForecasts.length) {
     throw new Error('All weather sources failed to provide a max temperature.');
