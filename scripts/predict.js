@@ -596,7 +596,9 @@ async function runPredictionCycle() {
   const errorRecords = computeSourceErrorRecords(predictionHistory, observedMap);
   const errorStats = computeErrorStats(errorRecords);
 
-  const openMeteoPromises = OPEN_METEO_MODELS.map(async (model) => {
+  // Stagger Open-Meteo requests by 200ms each to avoid hitting rate limits
+  const openMeteoPromises = OPEN_METEO_MODELS.map(async (model, i) => {
+    await new Promise(r => setTimeout(r, i * 200));
     try {
       const forecast = await fetchOpenMeteoModel(model.id, dates.today, dates.after);
       const index = forecast.payload.time.findIndex((day) => day === targetDate);
