@@ -605,7 +605,13 @@ async function runPredictionCycle() {
           name: polymarketData.name,
           status: polymarketData.status,
           expectation: marketExpectation,
-          outcomeNames: polymarketData.outcomes.map((o) => o.name)
+          outcomeNames: polymarketData.outcomes.map((o) => o.name),
+          // Full market "ladder": every temperature band with its current price.
+          // Lets us reconstruct how the odds evolve hour-by-hour for timing analysis.
+          outcomes: polymarketData.outcomes.map((o) => ({
+            name: o.name,
+            price: o.probability != null ? Number(Number(o.probability).toFixed(3)) : null
+          }))
         }
       : null,
     decision: null

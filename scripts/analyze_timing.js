@@ -95,7 +95,11 @@ async function main() {
 
   const observed = {};
   for (const o of observations) {
-    if (o.date && typeof o.maxTemp === 'number') observed[o.date] = o.maxTemp;
+    if (!o.date) continue;
+    // Timing analysis is about BETTING → use the Polymarket band (integer payout truth).
+    const band = typeof o.maxTempBand === 'number' ? o.maxTempBand
+      : (typeof o.maxTemp === 'number' ? o.maxTemp : null);
+    if (band !== null) observed[o.date] = band;
   }
 
   // Filter to last N days
@@ -106,7 +110,7 @@ async function main() {
     return;
   }
 
-  const sameDayEntries = [];   // offset=0, hour < 9 UTC
+  const sameDayEntries = [];   // offset=0, hour <= 14 UTC (≤17:00 MSK, before peak settles)
   const nextDayEntries = [];   // offset=1, hour < 21 UTC
 
   for (const p of recent) {
@@ -118,7 +122,7 @@ async function main() {
     const hour = new Date(p.timestamp).getUTCHours();
     const offset = p.targetDayOffset ?? 1;
 
-    if (offset === 0 && hour < 9) {
+    if (offset === 0 && hour <= 14) {
       sameDayEntries.push({ hour, forecastRounded, actual });
     } else if (offset === 1 && hour < 21) {
       nextDayEntries.push({ hour, forecastRounded, actual });
@@ -140,7 +144,7 @@ async function main() {
   const msg =
     `⏰ <b>Timing Analysis — last ${days} days</b>\n` +
     `(${totalSamples} hourly forecasts evaluated)\n\n` +
-    formatTable(sdStats, '📍 Same-day (offset=0, before 09:00 UTC)') + '\n' +
+    formatTable(sdStats, '📍 Same-day (offset=0, ≤14:00 UTC / 17:00 MSK)') + '\n' +
     formatTable(ndStats, '📅 Next-day (offset=1, before 21:00 UTC)') + '\n' +
     `<i>Best hour = highest accuracy, lowest avg error</i>`;
 

@@ -18,6 +18,7 @@ const path = require('path');
 const SCRIPTS = {
   fetchHistory: path.resolve(__dirname, 'fetch_history.js'),
   fetchObserved: path.resolve(__dirname, 'fetch_observed.js'),
+  backfillEra5: path.resolve(__dirname, 'backfill_era5.js'),
   predict: path.resolve(__dirname, 'predict.js'),
   dailyReport: path.resolve(__dirname, 'daily_report.js'),
   analyze: path.resolve(__dirname, 'analyze_accuracy.js'),
@@ -47,6 +48,8 @@ function run(scriptPath, label) {
   run(SCRIPTS.fetchHistory, 'Sync historical observations from Polymarket series');
   // Then fetch yesterday specifically (may not be resolved yet → falls back to ERA5).
   run(SCRIPTS.fetchObserved, 'Fetch yesterday\'s observed temperature');
+  // Fill in precise ERA5 values for any past dates that didn't have them yet (self-healing).
+  run(SCRIPTS.backfillEra5, 'Backfill precise ERA5 truth for calibration');
   // Send daily accuracy report to Telegram (compares past predictions vs Polymarket facts).
   run(SCRIPTS.dailyReport, 'Send daily accuracy report');
   // Run prediction for tomorrow.

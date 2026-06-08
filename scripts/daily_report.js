@@ -58,10 +58,16 @@ async function main() {
     readJsonLines(OBSERVED_LOG)
   ]);
 
-  // Build observed map: date → actual temp
-  const observed = {};
+  // Build observed maps: date → band (betting truth) and date → precise ERA5 (for bias).
+  // Older entries may only have maxTemp (band); newer ones add maxTempBand + maxTempEra5.
+  const observedBand = {};
+  const observedPrecise = {};
   for (const o of observations) {
-    if (o.date && typeof o.maxTemp === 'number') observed[o.date] = o.maxTemp;
+    if (!o.date) continue;
+    const band = typeof o.maxTempBand === 'number' ? o.maxTempBand
+      : (typeof o.maxTemp === 'number' ? o.maxTemp : null);
+    if (band !== null) observedBand[o.date] = band;
+    if (typeof o.maxTempEra5 === 'number') observedPrecise[o.date] = o.maxTempEra5;
   }
 
   // Build prediction map: date → latest prediction for that date
@@ -78,16 +84,20 @@ async function main() {
   // Match predictions with observations
   const results = [];
   for (const [date, pred] of Object.entries(predByDate)) {
-    if (!(date in observed)) continue;
-    const actual = observed[date];
+    if (!(date in observedBand)) continue;
+    const actualBand = observedBand[date];                 // integer band — for hit/payout
+    const actualPrecise = observedPrecise[date] ?? actualBand; // ERA5 if available — for bias
     const forecastRaw = pred.decision?.forecastRaw ?? pred.ensembleForecast?.consensus?.consensusValue ?? pred.ensembleForecast?.stats?.mean;
     const forecastRounded = pred.decision?.forecastRounded ?? (forecastRaw != null ? Math.round(forecastRaw) : null);
     const betOn = pred.decision?.betOn ?? (forecastRounded != null ? `${forecastRounded}°C` : null);
     if (forecastRounded == null) continue;
 
-    const hit = Math.round(actual) === forecastRounded;
-    const err = Number((actual - forecastRaw).toFixed(1));
-    results.push({ date, forecastRaw, forecastRounded, betOn, actual, hit, err });
+    // Did the bet win? Decided by the Polymarket band (integer).
+    const hit = Math.round(actualBand) === forecastRounded;
+    // Signed error for bias/MAE — measured against precise ERA5 when we have it.
+    const err = Number((actualPrecise - forecastRaw).toFixed(2));
+    const preciseUsed = date in observedPrecise;
+    results.push({ date, forecastRaw, forecastRounded, betOn, actual: actualBand, actualPrecise, preciseUsed, hit, err });
   }
 
   // Sort newest first
@@ -114,11 +124,17 @@ async function main() {
   const hits7 = last7.filter(r => r.hit).length;
   const hitsPrev7 = prev7.filter(r => r.hit).length;
 
-  // Bias: avg signed error over last 14 (positive = we over-predict, negative = under-predict)
+  // Bias: avg signed error over last 14. err = actual - forecast, so:
+  //   bias > 0 → actual runs hotter than our forecast → we UNDER-predict (занижаем)
+  //   bias < 0 → actual runs cooler than our forecast → we OVER-predict (завышаем)
   const bias = last14.length
     ? (last14.reduce((s, r) => s + r.err, 0) / last14.length).toFixed(2)
     : '0.00';
-  const biasDir = Number(bias) > 0.2 ? '↑ завышаем' : Number(bias) < -0.2 ? '↓ занижаем' : '≈ нейтрально';
+  const biasDir = Number(bias) > 0.2 ? '↓ занижаем' : Number(bias) < -0.2 ? '↑ завышаем' : '≈ нейтрально';
+  // How much of the bias window is measured against precise ERA5 (vs coarse band).
+  const era5Count = last14.filter(r => r.preciseUsed).length;
+  const biasBasis = era5Count === last14.length ? 'ERA5'
+    : era5Count === 0 ? 'корзина' : `ERA5 ${era5Count}/${last14.length}`;
 
   // Current streak
   let streak = 0;
@@ -149,7 +165,7 @@ async function main() {
     `  Средняя ошибка: ${avgErrAll}°C\n\n` +
     `<b>Последние 14 дней: ${hits14}/${last14.length}</b>\n` +
     `  Тренд: ${trendLabel}\n` +
-    `  Bias: ${bias}°C (${biasDir})\n` +
+    `  Bias: ${bias}°C (${biasDir}, по ${biasBasis})\n` +
     `  Серия: ${streakLabel}\n\n` +
     `<b>Прогноз vs Polymarket (14 дней):</b>\n<pre>${rows}</pre>`;
 

@@ -183,11 +183,20 @@ async function alreadyLogged(date) {
   }
 }
 
-async function appendObservation({ date, maxTemp, note, source }) {
+async function appendObservation({ date, maxTemp, maxTempBand, maxTempEra5, note, source }) {
   await fs.mkdir(path.dirname(OBSERVED_LOG_PATH), { recursive: true });
-  const entry = { date, maxTemp, source, observedAt: new Date().toISOString(), note: note ?? null };
+  const entry = {
+    date,
+    maxTemp,                       // betting truth (Polymarket band, integer) — what payouts use
+    maxTempBand: maxTempBand ?? null,
+    maxTempEra5: maxTempEra5 ?? null,  // precise ERA5 value (sub-degree) for model calibration
+    source,
+    observedAt: new Date().toISOString(),
+    note: note ?? null
+  };
   await fs.appendFile(OBSERVED_LOG_PATH, `${JSON.stringify(entry)}\n`, { encoding: 'utf8' });
-  console.log(`✅ Logged observed max for ${date}: ${maxTemp}°C (source: ${source})`);
+  const era5Str = maxTempEra5 != null ? `, era5: ${maxTempEra5}°C` : ', era5: pending';
+  console.log(`✅ Logged observed max for ${date}: ${maxTemp}°C (source: ${source}${era5Str})`);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -202,37 +211,63 @@ async function main() {
 
   console.log(`Fetching observed max temperature for ${date}…`);
 
-  // Priority order:
-  // 1. Polymarket resolved market — EXACT match with what Polymarket pays out on.
-  // 2. Open-Meteo ERA5            — reliable historical reanalysis.
-  // 3. Polymarket HTML scraping   — fragile fallback.
-  let result = null;
+  // We collect TWO truths, independently:
+  //   • Band  — Polymarket's resolved winning band (integer). This is what payouts use.
+  //   • ERA5  — Open-Meteo reanalysis (sub-degree). Used for precise model calibration/bias.
+  // ERA5 for very recent dates may not be published yet → left null, filled later by
+  // scripts/backfill_era5.js.
+  let band = null;        // integer band from Polymarket
+  let era5 = null;        // precise ERA5 value
+  let source = null;      // primary source label for maxTemp
+  let note = null;
 
+  // 1. Polymarket resolved band (preferred betting truth).
   try {
-    result = await fetchPolymarketResolved(date);
-    console.log(`✅ Polymarket resolved → ${result.maxTemp}°C (${result.note})`);
+    const r = await fetchPolymarketResolved(date);
+    band = r.maxTemp;
+    source = r.source;
+    note = r.note;
+    console.log(`✅ Polymarket resolved → ${band}°C (${r.note})`);
   } catch (err) {
     console.warn(`Polymarket resolved unavailable: ${err.message}`);
+  }
+
+  // 2. ERA5 precise (independent — always try, regardless of band success).
+  try {
+    const r = await fetchOpenMeteoHistorical(date);
+    era5 = r.maxTemp;
+    console.log(`✅ Open-Meteo ERA5 → ${era5}°C`);
+  } catch (err) {
+    console.warn(`ERA5 unavailable (will backfill later): ${err.message}`);
+  }
+
+  // 3. If neither worked, last-resort HTML scrape of the Polymarket page.
+  if (band === null && era5 === null) {
+    console.log('Falling back to Polymarket page scraping…');
     try {
-      result = await fetchOpenMeteoHistorical(date);
-      console.log(`Open-Meteo ERA5 → ${result.maxTemp}°C`);
-    } catch (err2) {
-      console.warn(`ERA5 unavailable: ${err2.message}`);
-      console.log('Falling back to Polymarket page scraping…');
-      try {
-        result = await fetchPolymarketObservation(date);
-        console.log(`Polymarket HTML → ${result.maxTemp}°C`);
-      } catch (err3) {
-        console.error(`All 3 sources failed for ${date}:`);
-        console.error(`  Polymarket resolved: ${err.message}`);
-        console.error(`  ERA5: ${err2.message}`);
-        console.error(`  Polymarket HTML: ${err3.message}`);
-        process.exit(1);
-      }
+      const r = await fetchPolymarketObservation(date);
+      band = r.maxTemp;
+      source = r.source;
+      note = r.note;
+      console.log(`Polymarket HTML → ${band}°C`);
+    } catch (err3) {
+      console.error(`All sources failed for ${date}: ${err3.message}`);
+      process.exit(1);
     }
   }
 
-  await appendObservation({ date, maxTemp: result.maxTemp, source: result.source, note: args.note ?? result.note ?? null });
+  // maxTemp = betting truth: prefer the band; if missing, round ERA5 as a stand-in.
+  const maxTemp = band != null ? band : Math.round(era5);
+  if (source === null) source = era5 != null ? 'open-meteo-era5' : 'unknown';
+
+  await appendObservation({
+    date,
+    maxTemp,
+    maxTempBand: band,
+    maxTempEra5: era5,
+    source,
+    note: args.note ?? note ?? null
+  });
 }
 
 main().catch((err) => {

@@ -40,6 +40,11 @@ function run(label, scriptPath, extraArgs = [], extraEnv = {}) {
   }
 }
 
+// Same-day forecasts only make sense before the daily temperature peak.
+// London peak ≈ 15:00–16:00 local (BST). 14:00 UTC = 17:00 MSK = 15:00 London.
+// After this, today's max is effectively settled → no betting value, stop offset=0.
+const SAME_DAY_CUTOFF_UTC = 14;
+
 // ── State tracking ─────────────────────────────────────────────────────────────
 let lastHourlyHour   = -1;  // UTC hour when last hourly run fired
 let lastDailyDate    = '';  // YYYY-MM-DD of last daily run
@@ -57,10 +62,15 @@ function tick() {
   const today = utcDateStr(now);
   const dow   = now.getUTCDay(); // 0 = Sunday
 
-  // 1. Hourly silent forecast — fire once per UTC hour (at :01 to avoid overlap with daily)
+  // 1. Hourly silent forecasts — fire once per UTC hour (at :01 to avoid overlap with daily)
   if (min >= 1 && hour !== lastHourlyHour) {
     lastHourlyHour = hour;
-    run('Hourly silent forecast', SCRIPTS.predictSilent, ['--silent']);
+    // Always forecast TOMORROW (offset=1) — long lead-time data for next-day timing.
+    run('Hourly forecast — tomorrow', SCRIPTS.predictSilent, ['--silent'], { TARGET_DAY_OFFSET: '1' });
+    // Also forecast TODAY (offset=0) until the peak has passed (≤14:00 UTC = 17:00 MSK).
+    if (hour <= SAME_DAY_CUTOFF_UTC) {
+      run('Hourly forecast — today', SCRIPTS.predictSilent, ['--silent'], { TARGET_DAY_OFFSET: '0' });
+    }
   }
 
   // 2. Daily full run — 09:00 UTC, TARGET_DAY_OFFSET=0 (today's forecast, most accurate)
@@ -78,10 +88,13 @@ function tick() {
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 log('weatherBOT scheduler started.');
-log('Jobs: hourly silent forecast | daily 09:00 UTC (TODAY offset=0) | weekly timing Sunday 10:00 UTC');
+log('Jobs: hourly forecast tomorrow + today(≤17:00 MSK) | daily 09:00 UTC report | weekly timing Sunday 10:00 UTC');
 
 // Fire immediately on startup so we don't wait up to an hour for first run.
-run('Startup: initial hourly forecast', SCRIPTS.predictSilent, ['--silent']);
+run('Startup: initial hourly forecast (tomorrow)', SCRIPTS.predictSilent, ['--silent'], { TARGET_DAY_OFFSET: '1' });
+if (new Date().getUTCHours() <= SAME_DAY_CUTOFF_UTC) {
+  run('Startup: initial hourly forecast (today)', SCRIPTS.predictSilent, ['--silent'], { TARGET_DAY_OFFSET: '0' });
+}
 lastHourlyHour = new Date().getUTCHours();
 
 // Check every 60 seconds.

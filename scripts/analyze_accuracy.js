@@ -24,9 +24,15 @@ async function readJsonLines(filePath) {
 }
 
 function buildObservedMap(entries) {
+  // This script measures model bias/RMSE → use the most PRECISE truth available:
+  // ERA5 (sub-degree) first, then the Polymarket band, then legacy maxTemp.
   return entries.reduce((map, entry) => {
-    if (!entry?.date || typeof entry.maxTemp !== 'number') return map;
-    map[entry.date] = entry.maxTemp;
+    if (!entry?.date) return map;
+    const precise = typeof entry.maxTempEra5 === 'number' ? entry.maxTempEra5
+      : typeof entry.maxTempBand === 'number' ? entry.maxTempBand
+      : typeof entry.maxTemp === 'number' ? entry.maxTemp
+      : null;
+    if (precise !== null) map[entry.date] = precise;
     return map;
   }, {});
 }
