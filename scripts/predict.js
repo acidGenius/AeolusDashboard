@@ -48,23 +48,31 @@ const WEATHER_LONGITUDE = 0.0495;
 const WEATHER_TIMEZONE = 'UTC';
 const WEATHER_TARGET_CITY = 'London';
 
+// Open-Meteo model IDs. Two rules that were previously broken:
+//   1. They MUST be passed via the `models=` param (plural). The old code used
+//      `model=` (singular) which Open-Meteo silently ignores → every request
+//      returned the SAME default blend, so the "ensemble" was 12 identical copies.
+//   2. The ID must be a real Open-Meteo model. The old list had 7 invalid IDs
+//      (ecmwf, icon, gfs, nam, gefs, ukmo, hrrr — all error out).
+// Every ID below was validated live against London/EGLC and returns a distinct
+// forecast. Prefer high-resolution NW-Europe models (UKMO, AROME, HARMONIE).
 const OPEN_METEO_MODELS = [
-  { id: 'ecmwf', label: 'ECMWF' },
-  { id: 'icon', label: 'ICON' },
-  { id: 'gfs', label: 'GFS' },
-  { id: 'nam', label: 'NAM' },
-  { id: 'gefs', label: 'GEFS' },
-  { id: 'ukmo', label: 'UKMO' },
-  { id: 'hrrr', label: 'HRRR' },
-  { id: 'ecmwf_ifs', label: 'ECMWF IFS' },
-  { id: 'icon_seamless', label: 'ICON Seamless' },
-  { id: 'gfs_seamless', label: 'GFS Seamless' },
-  { id: 'meteofrance_arpege_world', label: 'ARPEGE World' },
-  { id: 'knmi_seamless', label: 'KNMI Seamless' }
+  { id: 'ecmwf_ifs025', label: 'ECMWF' },
+  { id: 'gfs_seamless', label: 'GFS' },
+  { id: 'icon_seamless', label: 'ICON' },
+  { id: 'ukmo_seamless', label: 'UKMO' },
+  { id: 'meteofrance_arpege_world', label: 'ARPEGE' },
+  { id: 'meteofrance_arome_france', label: 'AROME' },
+  { id: 'knmi_seamless', label: 'KNMI' },
+  { id: 'dmi_seamless', label: 'DMI' },
+  { id: 'gem_seamless', label: 'GEM' },
+  { id: 'jma_seamless', label: 'JMA' },
+  { id: 'metno_seamless', label: 'MET Norway' },
+  { id: 'cma_grapes_global', label: 'CMA' }
 ];
 
-// External sources: removed wttr.in, Met Norway, 7timer — consistently inaccurate for London.
-// UKMO (Met Office Unified Model) is already included via Open-Meteo above.
+// Direct external scrapers (wttr.in, met.no API, 7timer) were removed — unreliable for London.
+// Note: MET Norway and UKMO ARE included above, but as proper Open-Meteo *models*, not scrapers.
 const EXTERNAL_SOURCES = [];
 
 const POLYMARKET_BASE_URL = process.env.POLYMARKET_BASE_URL || 'https://gamma-api.polymarket.com';
@@ -149,7 +157,7 @@ async function fetchOpenMeteoModel(modelId, startDate, endDate) {
       start_date: startDate,
       end_date: endDate,
       timezone: WEATHER_TIMEZONE,
-      model: modelId
+      models: modelId   // MUST be plural `models=` — singular `model=` is ignored by Open-Meteo.
     });
     const url = `https://api.open-meteo.com/v1/forecast?${params}`;
     const response = await fetch(url);
