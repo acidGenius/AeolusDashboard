@@ -683,19 +683,26 @@ async function runPredictionCycle() {
   };
 
   if (polymarketData) {
-    // Round forecast to whole degree (Polymarket resolution precision).
     const rawForecast = ensembleForecast.consensus?.consensusValue ?? stats?.median ?? 0;
-    const roundedForecast = Math.round(rawForecast);
     const confidenceScore = stats?.confidenceScore ?? null;
 
-    // Find the matching market outcome for our rounded forecast.
+    // Probability distribution over bands + value (edge) vs the market.
+    const distribution = computeBandDistribution(ensembleForecast.models);
+
+    // PRIMARY band selection: argmax of distribution = band with the most model votes.
+    // This directly implements "bet on what the majority of models point to".
+    // Falls back to round(consensus) only if distribution is empty.
+    const argmaxBand = Object.keys(distribution).length
+      ? Number(Object.entries(distribution).sort((a, b) => b[1] - a[1])[0][0])
+      : Math.round(rawForecast);
+    const roundedForecast = argmaxBand;
+
+    // Find the matching market outcome for our chosen band.
     const targetOutcome = polymarketData.outcomes.find(o => {
       const t = parseTemperatureFromOutcome(o.name);
       return t !== null && Math.round(t) === roundedForecast;
     }) ?? null;
 
-    // Probability distribution over bands + value (edge) vs the market.
-    const distribution = computeBandDistribution(ensembleForecast.models);
     const valueTable = computeValueTable(polymarketData.outcomes, distribution);
     // Best value bet = highest positive edge (market underprices our band the most).
     const bestValue = valueTable.find(v => v.edge > 0) ?? null;
