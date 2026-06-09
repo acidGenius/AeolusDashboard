@@ -5,3 +5,4 @@ memory/
 .env.backup*
 .openclaw/
 npm-debug.log*
+.DS_Store

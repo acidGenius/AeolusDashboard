@@ -1,0 +1,133 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Prediction {
+  id               String    @id @default(cuid())
+  timestamp        DateTime
+  targetDate       String
+  targetDayOffset  Int?
+  logFile          String?
+
+  forecastRaw      Float?
+  forecastRounded  Int?
+  betOn            String?
+  marketPrice      Float?
+  confidence       Float?
+  confidenceLabel  String?
+  spread           Float?
+
+  consensusValue    Float?
+  agreementRatio    Float?
+  sourceCount       Int?
+  consensusAchieved Boolean?
+
+  statsMean   Float?
+  statsMedian Float?
+  statsMin    Float?
+  statsMax    Float?
+  statsStddev Float?
+
+  marketId          String?
+  marketName        String?
+  marketStatus      String?
+  marketExpectation Float?
+
+  modelForecasts ModelForecast[]
+  marketOutcomes MarketOutcome[]
+  valueBets      ValueBet[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([targetDate, timestamp])
+  @@index([targetDate])
+  @@index([logFile])
+}
+
+model ModelForecast {
+  id               String     @id @default(cuid())
+  predictionId     String
+  prediction       Prediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+
+  source           String
+  label            String
+  maxTemp          Float
+  weight           Float?
+  normalizedWeight Float?
+  metaError        Float?
+
+  @@index([predictionId])
+  @@index([label])
+}
+
+model MarketOutcome {
+  id           String     @id @default(cuid())
+  predictionId String
+  prediction   Prediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+
+  name  String
+  price Float?
+  ourP  Float?
+  edge  Float?
+
+  @@index([predictionId])
+}
+
+model ValueBet {
+  id           String     @id @default(cuid())
+  predictionId String
+  prediction   Prediction @relation(fields: [predictionId], references: [id], onDelete: Cascade)
+
+  name  String
+  ourP  Float
+  price Float
+  edge  Float
+
+  @@index([predictionId])
+}
+
+model Observation {
+  id          String    @id @default(cuid())
+  date        String    @unique
+  maxTemp     Float
+  maxTempBand Float?
+  maxTempEra5 Float?
+  source      String?
+  observedAt  DateTime?
+  note        String?
+
+  createdAt DateTime @default(now())
+
+  @@index([date])
+}
+
+model PaperBet {
+  id       String @id @default(cuid())
+  type     String
+  strategy String
+
+  targetDate   String
+  band         Int?
+  betOn        String?
+  stake        Float
+  price        Float
+  ourP         Float?
+  edge         Float?
+  bankBefore   Float?
+  observedBand Float?
+  won          Boolean?
+  delta        Float?
+  bankAfter    Float?
+  placedAt     DateTime?
+  settledAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([strategy])
+  @@index([targetDate])
+}

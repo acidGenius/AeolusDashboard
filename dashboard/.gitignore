@@ -1,0 +1,33 @@
+# dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# build
+build/
+dist/
+
+# env — copy .env.example and fill in your values
+.env
+.env.local
+.env.*.local
+
+# database
+logs/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Next.js type declarations (auto-generated)
+next-env.d.ts
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editor
+.idea/
+.vscode/
